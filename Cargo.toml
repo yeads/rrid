@@ -1,0 +1,13 @@
+[package]
+name = "rrid"
+version = "0.1.0"
+edition = "2021"
+description = "A fixed-capacity integer ID pool with hierarchical bitmap and round-robin allocation for efficient resource management."
+license = "MIT"
+repository = "https://github.com/yeads/rrid"
+readme = "README.md"
+keywords = ["id-allocator", "bitmap", "pool", "resource-management", "round-robin"]
+categories = ["memory-management"]
+exclude = ["Cargo.lock", "target/"]
+
+[dev-dependencies]
