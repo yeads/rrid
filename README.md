@@ -10,7 +10,7 @@ A fixed-capacity integer ID pool with a **hierarchical bitmap** backend and **ro
 - **Round-robin allocation** — a scan pointer (`next_id`) wraps around the ring in round-robin fashion, delaying reuse of recently freed IDs.
 - **Safety watermark** — enforces a configurable minimum number of free IDs (`WATERMARK`).
 - **Hierarchical bitmap** — two-level bitmap enables O(1) amortised allocation by skipping full blocks.
-- **Zero-cost generics** — capacity and watermark are const-generic parameters resolved at compile time.
+- **Runtime configuration** — capacity and watermark are passed to `new(n, watermark)` at runtime; capacity is no longer capped at 4096.
 
 ## Quick Start
 
@@ -25,7 +25,7 @@ rrid = "0.1"
 use rrid::IdPool;
 
 fn main() {
-    let mut pool = IdPool::<1024, 64>::new().expect("valid pool");
+    let mut pool = IdPool::new(1024, 64).expect("valid pool");
 
     let id = pool.alloc().expect("pool not full");
     println!("allocated id = {id}");
@@ -45,7 +45,7 @@ fn main() {
 
 Allocation:
 
-1. If `free() <= WATERMARK`, return `PoolFull`.
+1. If `free() <= watermark`, return `PoolFull`.
 2. Starting from `next_id`, check the current block.
 3. If the block is full (secondary bit = 0), skip to the next block with a free bit.
 4. Use `trailing_zeros` on the inverted primary word to locate the first free bit.
@@ -61,7 +61,7 @@ Release:
 
 | Method | Description |
 |--------|-------------|
-| `IdPool::<N, W>::new()` | Create a new pool. Returns `None` if constraints are unsatisfiable. |
+| `IdPool::new(n, m)` | Create a new pool with capacity `n` and watermark `m`. Returns `None` if constraints are unsatisfiable. |
 | `alloc() -> Result<usize, Error>` | Allocate the next free ID. |
 | `release(id) -> Result<(), Error>` | Free a previously allocated ID. |
 | `allocated() -> usize` | Number of allocated IDs. |

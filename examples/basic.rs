@@ -4,7 +4,7 @@ use rrid::IdPool;
 
 fn main() {
     // Create a pool with 256 IDs and a safety watermark of 32.
-    let mut pool = IdPool::<256, 32>::new().expect("valid pool");
+    let mut pool = IdPool::new(256, 32).expect("valid pool");
 
     println!("capacity:  {}, watermark: {}", pool.capacity(), pool.watermark());
 

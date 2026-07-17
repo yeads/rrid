@@ -10,7 +10,7 @@
 - **Round-Robin 循环分配** — 扫描指针（`next_id`）以 Round-Robin 方式在环形空间中递增，延迟复用已释放的 ID。
 - **安全水位** — 可配置最低空闲 ID 数量（`WATERMARK`），拒绝低于水位的分配。
 - **两级 Bitmap** — 一级 Bitmap 记录每个 ID 的占用状态，二级 Bitmap 按 64 个 ID 分组标记是否存在空闲位，实现 O(1) 均摊分配。
-- **零成本泛型** — 容量和水位通过 const 泛型在编译期确定。
+- **运行时配置** — 容量和水位通过 `new(n, watermark)` 在运行时指定，容量不再受 4096 限制。
 
 ## 快速开始
 
@@ -25,7 +25,7 @@ rrid = "0.1"
 use rrid::IdPool;
 
 fn main() {
-    let mut pool = IdPool::<1024, 64>::new().expect("valid pool");
+    let mut pool = IdPool::new(1024, 64).expect("valid pool");
 
     let id = pool.alloc().expect("pool not full");
     println!("分配 ID = {id}");
@@ -61,7 +61,7 @@ fn main() {
 
 | 方法 | 说明 |
 |------|------|
-| `IdPool::<N, W>::new()` | 创建新池。约束不满足时返回 `None`。 |
+| `IdPool::new(n, m)` | 创建容量为 `n`、水位为 `m` 的新池。约束不满足时返回 `None`。 |
 | `alloc() -> Result<usize, Error>` | 分配下一个空闲 ID。 |
 | `release(id) -> Result<(), Error>` | 释放已分配的 ID。 |
 | `allocated() -> usize` | 当前已分配数量。 |

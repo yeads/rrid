@@ -35,63 +35,89 @@ impl fmt::Display for Error {
     }
 }
 
+impl std::error::Error for Error {}
+
 /// Fixed-capacity ID pool backed by a hierarchical bitmap with **round-robin** allocation.
 ///
-/// # Type Parameters
-///
-/// - `N` — total number of IDs managed by the pool (must be > 0).
-/// - `WATERMARK` — minimum number of free IDs to keep (safety margin; must be < N).
-///
-/// The primary bitmap uses one bit per ID, grouped into 64-bit words.
-/// The secondary bitmap is a single `u64` (supports up to 64 blocks = 4096 IDs).
-/// `N` must therefore be in `1..=4096`; [`IdPool::new`] returns `None` otherwise.
+/// Created with [`IdPool::new`] by passing the capacity `n` and watermark `m`
+/// at runtime. The primary bitmap uses one bit per ID, grouped into 64-bit
+/// words. The secondary bitmap uses one bit per 64-ID block (itself stored as
+/// 64-bit words) so the pool can scale to arbitrary capacities.
 ///
 /// # Examples
 ///
 /// ```
 /// use rrid::IdPool;
 ///
-/// let mut pool = IdPool::<128, 16>::new().unwrap();
+/// let mut pool = IdPool::new(128, 16).unwrap();
 /// let id = pool.alloc().unwrap();
 /// assert_eq!(id, 0);
 /// pool.release(id).unwrap();
 /// ```
-pub struct IdPool<const N: usize, const WATERMARK: usize> {
+pub struct IdPool {
+    n: usize,
+    watermark: usize,
     primary: Vec<u64>,
-    secondary: u64,
+    /// Secondary bitmap: one bit per 64-ID block; grouped into 64-bit words.
+    secondary: Vec<u64>,
     /// Round-robin scan pointer — the next ID position to start allocation from.
     next_id: usize,
     allocated: usize,
 }
 
-impl<const N: usize, const WATERMARK: usize> IdPool<N, WATERMARK> {
+impl IdPool {
     /// Number of 64-bit words in the primary bitmap.
-    const NUM_WORDS: usize = N.div_ceil(BLOCK_BITS);
+    #[inline]
+    fn num_words(n: usize) -> usize {
+        n.div_ceil(BLOCK_BITS)
+    }
 
-    /// Upper bound on the number of 64-bit blocks supported by the single
-    /// `u64` secondary bitmap.
-    const MAX_BLOCKS: usize = 64;
+    /// Number of 64-ID blocks covered by a pool of capacity `n`.
+    #[inline]
+    fn num_blocks(n: usize) -> usize {
+        n.div_ceil(BLOCK_BITS)
+    }
 
-    /// Create a new pool.
+    /// Number of 64-bit words in the secondary bitmap.
+    #[inline]
+    fn num_secondary_words(n: usize) -> usize {
+        Self::num_blocks(n).div_ceil(BLOCK_BITS)
+    }
+
+    /// Create a new pool with capacity `n` and watermark `m`.
     ///
     /// Returns `None` if:
-    /// - `N == 0`,
-    /// - `N > 4096` (the secondary bitmap only supports up to 64 blocks of
-    ///   64 IDs each — see type-level docs), or
-    /// - `WATERMARK >= N`.
-    pub fn new() -> Option<Self> {
-        if N == 0 || WATERMARK >= N || Self::num_blocks() > Self::MAX_BLOCKS {
+    /// - `n == 0`,
+    /// - `m >= n`, or
+    /// - the required allocation overflowed `usize`.
+    pub fn new(n: usize, watermark: usize) -> Option<Self> {
+        if n == 0 || watermark >= n {
             return None;
         }
-        let num_blocks = Self::num_blocks();
-        let secondary_mask = if num_blocks == Self::MAX_BLOCKS {
-            u64::MAX
-        } else {
-            (1u64 << num_blocks) - 1
-        };
+        let num_blocks = Self::num_blocks(n);
+        let num_secondary_words = Self::num_secondary_words(n);
+        // Guard against pathological usize overflow.
+        let num_words = Self::num_words(n);
+        num_words.checked_add(num_secondary_words)?;
+
+        let primary = vec![0u64; num_words];
+
+        // Mark every existing block as "has free" in the secondary bitmap.
+        let mut secondary = vec![0u64; num_secondary_words];
+        let full_secondary_words = num_blocks / BLOCK_BITS;
+        for word in secondary.iter_mut().take(full_secondary_words) {
+            *word = u64::MAX;
+        }
+        let rem = (num_blocks % BLOCK_BITS) as u32;
+        if rem != 0 {
+            secondary[full_secondary_words] = (1u64 << rem) - 1;
+        }
+
         Some(Self {
-            primary: vec![0u64; Self::NUM_WORDS],
-            secondary: secondary_mask,
+            n,
+            watermark,
+            primary,
+            secondary,
             next_id: 0,
             allocated: 0,
         })
@@ -106,28 +132,28 @@ impl<const N: usize, const WATERMARK: usize> IdPool<N, WATERMARK> {
     /// Number of currently free IDs.
     #[inline]
     pub fn free(&self) -> usize {
-        N - self.allocated
+        self.n - self.allocated
     }
 
     /// Watermark (safety margin).
     #[inline]
     pub fn watermark(&self) -> usize {
-        WATERMARK
+        self.watermark
     }
 
     /// Total capacity.
     #[inline]
     pub fn capacity(&self) -> usize {
-        N
+        self.n
     }
 
     /// Returns `true` if the given ID is currently allocated.
     ///
-    /// Returns `false` for IDs outside `[0, N)` so this never panics,
+    /// Returns `false` for IDs outside `[0, n)` so this never panics,
     /// unlike indexing the bitmap directly would.
     #[inline]
     pub fn is_allocated(&self, id: usize) -> bool {
-        if id >= N {
+        if id >= self.n {
             return false;
         }
         (self.primary[id / BLOCK_BITS] >> (id % BLOCK_BITS)) & 1 == 1
@@ -136,13 +162,13 @@ impl<const N: usize, const WATERMARK: usize> IdPool<N, WATERMARK> {
     /// Allocate the next available ID using round-robin scanning.
     ///
     /// Scans from `next_id` using the hierarchical bitmap to skip full blocks.
-    /// Returns `Err(PoolFull)` when the free count would drop to `WATERMARK`.
+    /// Returns `Err(PoolFull)` when the free count would drop to `watermark`.
     pub fn alloc(&mut self) -> Result<usize, Error> {
-        if self.free() <= WATERMARK {
+        if self.free() <= self.watermark {
             return Err(Error::PoolFull);
         }
 
-        let total_blocks = Self::num_blocks();
+        let total_blocks = Self::num_blocks(self.n);
         let start_block = self.next_id / BLOCK_BITS;
         let start_bit = self.next_id % BLOCK_BITS;
 
@@ -155,7 +181,7 @@ impl<const N: usize, const WATERMARK: usize> IdPool<N, WATERMARK> {
         // Phase 2: scan subsequent blocks (with wrap-around).
         for offset in 1..=total_blocks {
             let block = (start_block + offset) % total_blocks;
-            if self.secondary & (1u64 << block) == 0 {
+            if !self.block_has_free(block) {
                 continue; // block is full
             }
             if let Some(id) = self.scan_block(block, 0) {
@@ -171,7 +197,7 @@ impl<const N: usize, const WATERMARK: usize> IdPool<N, WATERMARK> {
     ///
     /// Does **not** modify `next_id`, so the ID will not be immediately reused.
     pub fn release(&mut self, id: usize) -> Result<(), Error> {
-        if id >= N {
+        if id >= self.n {
             return Err(Error::OutOfRange);
         }
         if !self.is_allocated(id) {
@@ -179,25 +205,40 @@ impl<const N: usize, const WATERMARK: usize> IdPool<N, WATERMARK> {
         }
         self.primary[id / BLOCK_BITS] &= !(1u64 << (id % BLOCK_BITS));
         self.allocated -= 1;
-        self.secondary |= 1u64 << (id / BLOCK_BITS);
+        self.set_block_has_free(id / BLOCK_BITS, true);
         Ok(())
     }
 
     // ------------------------------------------------------------------
-    //  Internal helpers
+    //  Internal helpers — secondary bitmap access
     // ------------------------------------------------------------------
 
     #[inline]
-    fn num_blocks() -> usize {
-        N.div_ceil(BLOCK_BITS)
+    fn block_has_free(&self, block: usize) -> bool {
+        (self.secondary[block / BLOCK_BITS] >> (block % BLOCK_BITS)) & 1 == 1
     }
+
+    #[inline]
+    fn set_block_has_free(&mut self, block: usize, value: bool) {
+        let word = block / BLOCK_BITS;
+        let bit = block % BLOCK_BITS;
+        if value {
+            self.secondary[word] |= 1u64 << bit;
+        } else {
+            self.secondary[word] &= !(1u64 << bit);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    //  Internal helpers — scanning
+    // ------------------------------------------------------------------
 
     /// Scan a single 64-bit block starting from `bit_offset` and allocate the
     /// first free bit. Returns the global ID if found.
     fn scan_block(&mut self, block: usize, bit_offset: usize) -> Option<usize> {
-        debug_assert!(block < Self::num_blocks());
+        debug_assert!(block < Self::num_blocks(self.n));
 
-        if self.secondary & (1u64 << block) == 0 {
+        if !self.block_has_free(block) {
             return None;
         }
 
@@ -215,7 +256,7 @@ impl<const N: usize, const WATERMARK: usize> IdPool<N, WATERMARK> {
         }
         let trailing = free.trailing_zeros() as usize;
         let id = block * BLOCK_BITS + trailing;
-        if id >= N {
+        if id >= self.n {
             return None;
         }
         self.mark_allocated(block, trailing);
@@ -227,25 +268,31 @@ impl<const N: usize, const WATERMARK: usize> IdPool<N, WATERMARK> {
         self.primary[block] |= 1u64 << bit;
         self.allocated += 1;
         if self.primary[block] == u64::MAX {
-            self.secondary &= !(1u64 << block);
+            self.set_block_has_free(block, false);
         }
     }
 
     #[inline]
     fn advance_next(&mut self, id: usize) {
-        self.next_id = (id + 1) % N;
+        self.next_id = (id + 1) % self.n;
     }
 }
 
-impl<const N: usize, const WATERMARK: usize> fmt::Debug for IdPool<N, WATERMARK> {
+impl fmt::Debug for IdPool {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IdPool")
-            .field("capacity", &N)
-            .field("watermark", &WATERMARK)
+            .field("capacity", &self.n)
+            .field("watermark", &self.watermark)
             .field("allocated", &self.allocated)
-            .field("free", &(N - self.allocated))
+            .field("free", &(self.n - self.allocated))
             .field("next_id", &self.next_id)
             .finish()
+    }
+}
+
+impl Default for IdPool {
+    fn default() -> Self {
+        Self::new(1, 0).expect("default IdPool is well-formed")
     }
 }
 
@@ -255,7 +302,7 @@ mod tests {
 
     #[test]
     fn basic_alloc_release() {
-        let mut pool = IdPool::<8, 2>::new().unwrap();
+        let mut pool = IdPool::new(8, 2).unwrap();
         assert_eq!(pool.capacity(), 8);
         assert_eq!(pool.watermark(), 2);
         assert_eq!(pool.free(), 8);
@@ -277,7 +324,7 @@ mod tests {
 
     #[test]
     fn watermark_enforced() {
-        let mut pool = IdPool::<4, 2>::new().unwrap();
+        let mut pool = IdPool::new(4, 2).unwrap();
         let _ = pool.alloc().unwrap(); // 0
         let _ = pool.alloc().unwrap(); // 1
         // free() == 2 == WATERMARK → next alloc should fail.
@@ -286,7 +333,7 @@ mod tests {
 
     #[test]
     fn wrap_around() {
-        let mut pool = IdPool::<4, 0>::new().unwrap();
+        let mut pool = IdPool::new(4, 0).unwrap();
         for i in 0..4 {
             assert_eq!(pool.alloc().unwrap(), i);
         }
@@ -302,7 +349,7 @@ mod tests {
     #[test]
     fn hierarchical_skip() {
         // 128 IDs → 2 blocks of 64. Fill block 0 completely.
-        let mut pool = IdPool::<128, 0>::new().unwrap();
+        let mut pool = IdPool::new(128, 0).unwrap();
         for _ in 0..64 {
             pool.alloc().unwrap();
         }
@@ -313,7 +360,7 @@ mod tests {
 
     #[test]
     fn release_does_not_reuse_immediately() {
-        let mut pool = IdPool::<8, 0>::new().unwrap();
+        let mut pool = IdPool::new(8, 0).unwrap();
         let id0 = pool.alloc().unwrap(); // 0
         let _id1 = pool.alloc().unwrap(); // 1
         pool.release(id0).unwrap();
@@ -324,13 +371,13 @@ mod tests {
 
     #[test]
     fn out_of_range() {
-        let mut pool = IdPool::<8, 0>::new().unwrap();
+        let mut pool = IdPool::new(8, 0).unwrap();
         assert_eq!(pool.release(10), Err(Error::OutOfRange));
     }
 
     #[test]
     fn double_release() {
-        let mut pool = IdPool::<8, 0>::new().unwrap();
+        let mut pool = IdPool::new(8, 0).unwrap();
         let id = pool.alloc().unwrap();
         pool.release(id).unwrap();
         assert_eq!(pool.release(id), Err(Error::AlreadyAllocated));
@@ -338,7 +385,7 @@ mod tests {
 
     #[test]
     fn full_cycle() {
-        let mut pool = IdPool::<64, 0>::new().unwrap();
+        let mut pool = IdPool::new(64, 0).unwrap();
         // Allocate all 64 IDs.
         for i in 0..64 {
             assert_eq!(pool.alloc().unwrap(), i);
@@ -356,8 +403,8 @@ mod tests {
     }
 
     #[test]
-    fn large_pool() {
-        let mut pool = IdPool::<4096, 100>::new().unwrap();
+    fn large_pool_within_single_secondary_word() {
+        let mut pool = IdPool::new(4096, 100).unwrap();
         // Allocate up to watermark.
         for _ in 0..(4096 - 100) {
             pool.alloc().unwrap();
@@ -367,20 +414,19 @@ mod tests {
     }
 
     #[test]
-    fn reject_pool_larger_than_4096() {
-        // N exceeding the 64-block secondary-bitmap limit must be rejected,
-        // otherwise `1u64 << block` would overflow and corrupt state.
-        assert!(IdPool::<4097, 0>::new().is_none());
-        assert!(IdPool::<8192, 0>::new().is_none());
-        // 4096 is exactly 64 blocks and is the maximum allowed.
-        assert!(IdPool::<4096, 0>::new().is_some());
+    fn rejects_invalid_params() {
+        assert!(IdPool::new(0, 0).is_none());
+        assert!(IdPool::new(8, 8).is_none());
+        assert!(IdPool::new(8, 10).is_none());
+        // Boundary: watermark just below capacity is valid.
+        assert!(IdPool::new(8, 7).is_some());
     }
 
     #[test]
     fn boundary_pool_4096_allocates_all() {
-        // Regression: 4096 IDs = 64 blocks; the last block must participate
-        // in allocation, and filling it must not panic on `1u64 << 64`.
-        let mut pool = IdPool::<4096, 0>::new().unwrap();
+        // 4096 IDs = 64 blocks; the last block must participate in allocation,
+        // and filling it must not panic on secondary-bitmap access.
+        let mut pool = IdPool::new(4096, 0).unwrap();
         for i in 0..4096 {
             assert_eq!(pool.alloc().unwrap(), i);
         }
@@ -392,8 +438,38 @@ mod tests {
     }
 
     #[test]
+    fn pool_larger_than_4096_supported() {
+        // Regression for the previous 4096 single-u64 secondary limit.
+        // 8192 IDs => 128 blocks => 2 secondary words.
+        let mut pool = IdPool::new(8192, 0).unwrap();
+        for i in 0..8192 {
+            assert_eq!(pool.alloc().unwrap(), i);
+        }
+        assert_eq!(pool.alloc(), Err(Error::PoolFull));
+        // Release an ID in block 64 (which lives in secondary word 1).
+        let id = 64 * BLOCK_BITS;
+        pool.release(id).unwrap();
+        assert_eq!(pool.alloc().unwrap(), id);
+    }
+
+    #[test]
+    fn pool_crossing_secondary_word_boundary() {
+        // 5000 IDs → 79 blocks → 2 secondary words. The high word holds 15 bits.
+        let mut pool = IdPool::new(5000, 0).unwrap();
+        for i in 0..5000 {
+            assert_eq!(pool.alloc().unwrap(), i);
+        }
+        assert_eq!(pool.alloc(), Err(Error::PoolFull));
+        //release the very last block's first id.
+        let last_block = 5000 / BLOCK_BITS; // block 78
+        let id = last_block * BLOCK_BITS; // 4992... actually 78*64 = 4992
+        pool.release(id).unwrap();
+        assert_eq!(pool.alloc().unwrap(), id);
+    }
+
+    #[test]
     fn is_allocated_out_of_range_is_false() {
-        let pool = IdPool::<8, 0>::new().unwrap();
+        let pool = IdPool::new(8, 0).unwrap();
         // Must not panic; out-of-range IDs are reported as "not allocated".
         assert!(!pool.is_allocated(8));
         assert!(!pool.is_allocated(usize::MAX));
