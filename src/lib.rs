@@ -44,6 +44,7 @@ impl fmt::Display for Error {
 ///
 /// The primary bitmap uses one bit per ID, grouped into 64-bit words.
 /// The secondary bitmap is a single `u64` (supports up to 64 blocks = 4096 IDs).
+/// `N` must therefore be in `1..=4096`; [`IdPool::new`] returns `None` otherwise.
 ///
 /// # Examples
 ///
@@ -67,15 +68,23 @@ impl<const N: usize, const WATERMARK: usize> IdPool<N, WATERMARK> {
     /// Number of 64-bit words in the primary bitmap.
     const NUM_WORDS: usize = N.div_ceil(BLOCK_BITS);
 
+    /// Upper bound on the number of 64-bit blocks supported by the single
+    /// `u64` secondary bitmap.
+    const MAX_BLOCKS: usize = 64;
+
     /// Create a new pool.
     ///
-    /// Returns `None` if `N == 0` or `WATERMARK >= N`.
+    /// Returns `None` if:
+    /// - `N == 0`,
+    /// - `N > 4096` (the secondary bitmap only supports up to 64 blocks of
+    ///   64 IDs each — see type-level docs), or
+    /// - `WATERMARK >= N`.
     pub fn new() -> Option<Self> {
-        if N == 0 || WATERMARK >= N {
+        if N == 0 || WATERMARK >= N || Self::num_blocks() > Self::MAX_BLOCKS {
             return None;
         }
         let num_blocks = Self::num_blocks();
-        let secondary_mask = if num_blocks >= 64 {
+        let secondary_mask = if num_blocks == Self::MAX_BLOCKS {
             u64::MAX
         } else {
             (1u64 << num_blocks) - 1
@@ -113,9 +122,14 @@ impl<const N: usize, const WATERMARK: usize> IdPool<N, WATERMARK> {
     }
 
     /// Returns `true` if the given ID is currently allocated.
+    ///
+    /// Returns `false` for IDs outside `[0, N)` so this never panics,
+    /// unlike indexing the bitmap directly would.
     #[inline]
     pub fn is_allocated(&self, id: usize) -> bool {
-        debug_assert!(id < N);
+        if id >= N {
+            return false;
+        }
         (self.primary[id / BLOCK_BITS] >> (id % BLOCK_BITS)) & 1 == 1
     }
 
@@ -350,5 +364,38 @@ mod tests {
         }
         assert_eq!(pool.alloc(), Err(Error::PoolFull));
         assert_eq!(pool.free(), 100);
+    }
+
+    #[test]
+    fn reject_pool_larger_than_4096() {
+        // N exceeding the 64-block secondary-bitmap limit must be rejected,
+        // otherwise `1u64 << block` would overflow and corrupt state.
+        assert!(IdPool::<4097, 0>::new().is_none());
+        assert!(IdPool::<8192, 0>::new().is_none());
+        // 4096 is exactly 64 blocks and is the maximum allowed.
+        assert!(IdPool::<4096, 0>::new().is_some());
+    }
+
+    #[test]
+    fn boundary_pool_4096_allocates_all() {
+        // Regression: 4096 IDs = 64 blocks; the last block must participate
+        // in allocation, and filling it must not panic on `1u64 << 64`.
+        let mut pool = IdPool::<4096, 0>::new().unwrap();
+        for i in 0..4096 {
+            assert_eq!(pool.alloc().unwrap(), i);
+        }
+        assert_eq!(pool.alloc(), Err(Error::PoolFull));
+        assert_eq!(pool.free(), 0);
+        // Release and realloc the very last ID (id 4095, block 63 high bit).
+        pool.release(4095).unwrap();
+        assert_eq!(pool.alloc().unwrap(), 4095);
+    }
+
+    #[test]
+    fn is_allocated_out_of_range_is_false() {
+        let pool = IdPool::<8, 0>::new().unwrap();
+        // Must not panic; out-of-range IDs are reported as "not allocated".
+        assert!(!pool.is_allocated(8));
+        assert!(!pool.is_allocated(usize::MAX));
     }
 }
