@@ -21,8 +21,8 @@ pub enum Error {
     PoolFull,
     /// The requested ID is out of range.
     OutOfRange,
-    /// The requested ID is already allocated.
-    AlreadyAllocated,
+    /// The requested ID is not allocated.
+    NotAllocated,
 }
 
 impl fmt::Display for Error {
@@ -30,7 +30,7 @@ impl fmt::Display for Error {
         match self {
             Error::PoolFull => write!(f, "pool is at watermark"),
             Error::OutOfRange => write!(f, "id out of range"),
-            Error::AlreadyAllocated => write!(f, "id already allocated"),
+            Error::NotAllocated => write!(f, "id not allocated"),
         }
     }
 }
@@ -201,7 +201,7 @@ impl IdPool {
             return Err(Error::OutOfRange);
         }
         if !self.is_allocated(id) {
-            return Err(Error::AlreadyAllocated);
+            return Err(Error::NotAllocated);
         }
         self.primary[id / BLOCK_BITS] &= !(1u64 << (id % BLOCK_BITS));
         self.allocated -= 1;
@@ -380,7 +380,7 @@ mod tests {
         let mut pool = IdPool::new(8, 0).unwrap();
         let id = pool.alloc().unwrap();
         pool.release(id).unwrap();
-        assert_eq!(pool.release(id), Err(Error::AlreadyAllocated));
+        assert_eq!(pool.release(id), Err(Error::NotAllocated));
     }
 
     #[test]
